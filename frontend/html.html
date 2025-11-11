@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Document</title>
+</head>
+
+<body>
+    <!-- Trang nhóm -->
+    <div class="content-task" id="groupArea">
+        <div class="chat-wrapper" style="display:flex;flex-direction:column">
+            <div class="chat-header-bar">
+                <div style="display:flex;flex-direction:column">
+                    <div style="font-weight:800;color:var(--text)">
+                        <%= group.groupName %>
+                    </div>
+                    <div id="memberCountRight" style="font-size:0.9rem;color:var(--text-muted)">
+                        <%= group.memberCount %> thành viên
+                    </div>
+                </div>
+                <div style="display:flex;gap:12px">
+                    <button id="addMemberBtnSmall"
+                        style="background:linear-gradient(180deg,var(--primary) 0%,var(--primary-hover) 100%);color:var(--on-primary);border:none;padding:10px 16px;border-radius:10px;font-weight:700;box-shadow:0 6px 18px rgba(76,175,80,0.18);cursor:pointer">
+                        + Thêm thành viên
+                    </button>
+                    <button id="createTaskBtnSmall"
+                        style="background:linear-gradient(180deg,#2ecc71 0%,#2fbf5a 100%);color:var(--on-primary);border:none;padding:10px 16px;border-radius:10px;font-weight:700;cursor:pointer">
+                        Tạo công việc
+                    </button>
+                    <!-- Thêm thành viên -->
+                    <div class="popup-overlay" id="popupMember" aria-hidden="true">
+                        <div class="popup-content" role="dialog" aria-modal="true" aria-labelledby="create-group-title">
+                            <button class="close-btn" id="closeMemberPopup" aria-label="Đóng">
+                                &times;
+                            </button>
+                            <div class="popup-inner-content" style="flex-direction: column; width: 100%">
+                                <div>
+                                    <div id="create-group-title" class="popup-title">
+                                        Thêm thành viên
+                                    </div>
+                                    <form id="memberForm" action="/groups" method="POST"
+                                        style="display: flex; flex-direction: column; gap: 18px; min-width: 260px;">
+                                        <input type="hidden" name="csrf_token" value="" />
+                                        <div style="display: flex; flex-direction: column; gap: 6px">
+                                            <label for="memberName" class="form-label" style="font-weight: 600">Tên tài
+                                                khoản/Email</label>
+                                            <input id="memberName" name="memberName" type="text" required
+                                                placeholder="Nhập tên tài khoản hoặc Email" class="form-input"
+                                                style="padding: 10px 13px" />
+                                        </div>
+                                        <div style="display: flex; justify-content: flex-end; gap: 12px">
+                                            <button type="button" class="btn" id="cancelMenberBtn"
+                                                style="background: #9e9e9e">Huỷ</button>
+                                            <button type="submit" class="btn" id="createGroupBtn">Thêm</button>
+                                        </div>
+                                    </form>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            <!-- khu vucj chat -->
+            <div class="outputChat"></div>
+            <div class="inputChat">
+                <label for="fileInput" class="sendFile">Chọn file</label>
+                <input type="file" id="fileInput" style="display:none" />
+                <input type="text" id="messageInput" placeholder=". . .">
+                <button class="sendMessage">Gửi</button>
+            </div>
+        </div>
+    </div>
+    </div>
+</body>
+
+</html>
