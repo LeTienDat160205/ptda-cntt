@@ -2,12 +2,40 @@ import express from "express";
 import db from "../config/db.js";
 import { v7 as uuidv7 } from "uuid";
 import { randomUUID } from "crypto";
+import multer from "multer";
+import fs from "fs";
+import path from "path";
+
+// Ensure uploads/tasks directory exists
+const TASK_UPLOAD_DIR = path.join(process.cwd(), "uploads", "tasks");
+try {
+  fs.mkdirSync(TASK_UPLOAD_DIR, { recursive: true });
+} catch (err) {
+  console.error("Could not create upload directory", TASK_UPLOAD_DIR, err);
+}
+
+// Multer storage for task attachments
+const storage = multer.diskStorage({
+  destination: function (req, file, cb) {
+    cb(null, TASK_UPLOAD_DIR);
+  },
+  filename: function (req, file, cb) {
+    const safeName = file.originalname.replace(/[^a-zA-Z0-9_.()-]/g, "_");
+    const name = `${Date.now()}-${Math.random()
+      .toString(36)
+      .slice(2, 8)}-${safeName}`;
+    cb(null, name);
+  },
+});
+
+const upload = multer({ storage });
 
 const router = express.Router();
 
 // middleware to ensure logged in
 function ensureAuth(req, res, next) {
-  if (!req.session || !req.session.user) return res.status(401).json({ error: "Unauthorized" });
+  if (!req.session || !req.session.user)
+    return res.status(401).json({ error: "Unauthorized" });
   next();
 }
 
@@ -17,7 +45,11 @@ function ensureAuth(req, res, next) {
 router.post("/", ensureAuth, async (req, res) => {
   try {
     const { groupName } = req.body;
-    if (!groupName || typeof groupName !== "string" || groupName.trim().length === 0) {
+    if (
+      !groupName ||
+      typeof groupName !== "string" ||
+      groupName.trim().length === 0
+    ) {
       return res.status(400).json({ error: "groupName is required" });
     }
     const name = groupName.trim();
@@ -65,6 +97,324 @@ router.get("/my-groups", ensureAuth, async (req, res) => {
   }
 });
 
+/* ============================================================
+                      TẠO CÔNG VIỆC
+============================================================ */
+// Use a wrapper to catch multer errors and return JSON instead of an HTML error page
+router.post(
+  "/createTask",
+  ensureAuth,
+  (req, res, next) => {
+    upload.array("attachments")(req, res, function (err) {
+      if (err) {
+        console.error("Multer upload error:", err);
+        // return JSON so client.parse won't fail on HTML error page
+        return res.status(400).json({
+          error: "File upload error",
+          details: err.message || String(err),
+        });
+      }
+      next();
+    });
+  },
+  async (req, res) => {
+    try {
+      let { taskName, description, deadline, groupId, assignees } = req.body;
+
+      // Người tạo task
+      const createdBy = req.session.user.id;
+
+      // Nếu FE gửi dạng string -> parse JSON
+      if (typeof assignees === "string") {
+        try {
+          assignees = JSON.parse(assignees);
+        } catch (err) {
+          return res.status(400).json({ error: "Assignees không hợp lệ." });
+        }
+      }
+
+      console.log("------ DEBUG TASK CREATE ------");
+      console.log("taskName:", taskName);
+      console.log("description:", description);
+      console.log("deadline:", deadline);
+      console.log("groupId:", groupId);
+      console.log("assignees raw:", req.body.assignees);
+      console.log("assignees after parse:", assignees);
+      console.log("typeof assignees:", typeof assignees);
+      console.log("isArray?", Array.isArray(assignees));
+      console.log("--------------------------------");
+
+      if (!taskName || !groupId || !Array.isArray(assignees)) {
+        return res.status(400).json({ error: "Thiếu dữ liệu cần thiết." });
+      }
+
+      const taskId = uuidv7();
+
+      // Tạo task
+      const sqlTask = `
+      INSERT INTO task (id, taskName, description, deadline, createdBy, groupId)
+      VALUES (UUID_TO_BIN(?), ?, ?, ?, UUID_TO_BIN(?), UUID_TO_BIN(?))
+    `;
+      await db
+        .promise()
+        .query(sqlTask, [
+          taskId,
+          taskName,
+          description || null,
+          deadline || null,
+          createdBy,
+          groupId,
+        ]);
+
+      // Giao cho nhiều người
+      const sqlAssignee = `
+      INSERT INTO task_assignee (id, taskId, userId)
+      VALUES (UUID_TO_BIN(?), UUID_TO_BIN(?), UUID_TO_BIN(?))
+    `;
+
+      // SQL tạo thông báo
+      const sqlNotify = `
+  INSERT INTO notification (
+      id, userId, senderId, message, type, referenceId
+  )
+  VALUES (
+      UUID_TO_BIN(?), UUID_TO_BIN(?), UUID_TO_BIN(?), ?, 'task', UUID_TO_BIN(?)
+  )
+`;
+
+      for (const uid of assignees) {
+        const assignId = uuidv7();
+        await db.promise().query(sqlAssignee, [assignId, taskId, uid]);
+
+        const notifId = uuidv7();
+        const message = `Bạn được giao công việc mới: "${taskName}"`;
+
+        await db.promise().query(sqlNotify, [
+          notifId, // id thông báo
+          uid, // user nhận thông báo
+          createdBy, // người giao task
+          message, // message hiển thị
+          taskId, // referenceId liên kết đến task
+        ]);
+      }
+
+      // ========================================
+      // TẠO PHÒNG CHAT DÀNH CHO TASK
+      // ========================================
+      const chatId = uuidv7();
+
+      const sqlCreateChat = `
+  INSERT INTO chat (id, chatType, name, taskId, createdBy)
+  VALUES (UUID_TO_BIN(?), 'task', ?, UUID_TO_BIN(?), UUID_TO_BIN(?))
+`;
+
+      await db
+        .promise()
+        .query(sqlCreateChat, [chatId, taskName, taskId, createdBy]);
+
+      // ========================================
+      // UPDATE task.chatId
+      // ========================================
+      await db
+        .promise()
+        .query(
+          `UPDATE task SET chatId = UUID_TO_BIN(?) WHERE id = UUID_TO_BIN(?)`,
+          [chatId, taskId]
+        );
+
+      // Cập nhật số task của group
+      await db.promise().query(
+        `UPDATE \`group\`
+       SET taskCount = (SELECT COUNT(*) FROM task WHERE groupId = UUID_TO_BIN(?))
+       WHERE id = UUID_TO_BIN(?)`,
+        [groupId, groupId]
+      );
+
+      // Nếu có file đính kèm => lưu metadata vào bảng `file` và trả về danh sách file vừa upload
+      const uploadedFiles = [];
+      if (req.files && Array.isArray(req.files) && req.files.length > 0) {
+        const insertFileSql = `
+          INSERT INTO file (id, taskId, userId, fileName, fileType, fileSize, filePath, fileCategory)
+          VALUES (UUID_TO_BIN(?), UUID_TO_BIN(?), UUID_TO_BIN(?), ?, ?, ?, ?, 'attachment')
+        `;
+
+        for (const f of req.files) {
+          const fileId = uuidv7();
+          const fileName = f.originalname;
+          const fileType = f.mimetype || null;
+          const fileSize = f.size || 0;
+          // store relative path for serving later
+          const relPath = path
+            .join("/uploads/tasks", path.basename(f.path))
+            .replace(/\\/g, "/");
+          try {
+            await db
+              .promise()
+              .query(insertFileSql, [
+                fileId,
+                taskId,
+                createdBy,
+                fileName,
+                fileType,
+                fileSize,
+                relPath,
+              ]);
+            uploadedFiles.push({
+              id: fileId,
+              fileName,
+              filePath: relPath,
+              fileType,
+              fileSize,
+            });
+          } catch (err) {
+            console.error("Failed to insert file metadata", err);
+          }
+        }
+      }
+
+      return res.status(201).json({
+        success: true,
+        message: "Tạo công việc thành công.",
+        taskId,
+        chatId,
+        files: uploadedFiles,
+      });
+    } catch (err) {
+      console.error("POST /groups error:", err);
+      // If headers already sent, fallback to ending the response
+      try {
+        if (!res.headersSent)
+          return res.status(500).json({ error: "Internal server error" });
+      } catch (e) {
+        console.error("Error sending 500 response", e);
+      }
+    }
+  }
+);
+
+/* ============================================================
+           LẤY DANH SÁCH CÔNG VIỆC ĐÃ GIAO (createdBy)
+============================================================ */
+router.get("/assignedTasks", ensureAuth, async (req, res) => {
+  try {
+    const userId = req.session.user.id;
+
+    const sql = `
+SELECT 
+    BIN_TO_UUID(t.id) AS id,
+    t.taskName,
+    t.description,
+    t.deadline,
+    t.status AS taskStatus,
+    t.createdAt,
+    t.updatedAt,
+    BIN_TO_UUID(t.groupId) AS groupId,
+    g.groupName,
+    BIN_TO_UUID(t.createdBy) AS creatorId,
+    u_creator.name AS creatorName,
+    u_creator.avatarPath AS creatorAvatar
+FROM task t
+LEFT JOIN \`group\` g ON t.groupId = g.id
+   LEFT JOIN user u_creator ON t.createdBy = u_creator.id
+WHERE t.createdBy = UUID_TO_BIN(?)
+
+ORDER BY t.createdAt DESC;
+    `;
+
+    const [rows] = await db.promise().query(sql, [userId]);
+    return res.json(rows);
+  } catch (err) {
+    // console.error("GET /tasks/assigned error:", err);
+    console.error("GET /groups/assignedTasks error:", err);
+    return res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// ==================== LẤY ASSIGNEES CHO 1 TASK (dùng bởi client: /groups/:taskId/assignees)
+router.get("/:taskId/assignees", ensureAuth, async (req, res) => {
+  try {
+    const { taskId } = req.params;
+    const sql = `
+          SELECT
+            BIN_TO_UUID(ta.userId) AS userId,
+            ta.status AS assigneeStatus,
+            u.name,
+            u.avatarPath
+          FROM task_assignee ta
+          LEFT JOIN user u ON ta.userId = u.id
+          WHERE ta.taskId = UUID_TO_BIN(?)
+          ORDER BY ta.id ASC
+        `;
+    const [rows] = await db.promise().query(sql, [taskId]);
+    res.json(rows || []);
+  } catch (err) {
+    console.error("GET /groups/:taskId/assignees error:", err);
+    res.status(500).json({ error: "Lỗi khi tải assignees" });
+  }
+});
+
+/* ============================================================
+         LẤY DANH SÁCH CÔNG VIỆC ĐƯỢC GIAO CHO MÌNH
+============================================================ */
+router.get("/receivedTasks", ensureAuth, async (req, res) => {
+  try {
+    const userId = req.session.user.id;
+
+    const sql = `
+SELECT
+    BIN_TO_UUID(t.id) AS id,
+    t.taskName,
+    t.description,
+    t.deadline,
+    t.status AS taskStatus,
+    t.createdAt,
+    t.updatedAt,
+    BIN_TO_UUID(t.groupId) AS groupId,
+    g.groupName,
+    BIN_TO_UUID(t.createdBy) AS creatorId,
+    u_creator.name AS creatorName,
+    u_creator.avatarPath AS creatorAvatar
+FROM task_assignee ta
+INNER JOIN task t ON ta.taskId = t.id
+LEFT JOIN \`group\` g ON t.groupId = g.id
+   LEFT JOIN user u_creator ON t.createdBy = u_creator.id
+
+WHERE ta.userId = UUID_TO_BIN(?)
+
+ORDER BY t.createdAt DESC;
+    `;
+
+    const [rows] = await db.promise().query(sql, [userId]);
+    return res.json(rows);
+  } catch (err) {
+    // console.error("GET /tasks/received error:", err);
+    console.error("GET /groups/receivedTasks error:", err);
+    return res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+router.get("/notifications", ensureAuth, async (req, res) => {
+  const userId = req.session.user.id;
+
+  const sql = `
+    SELECT 
+      BIN_TO_UUID(id) AS id,
+      BIN_TO_UUID(userId) AS userId,
+      BIN_TO_UUID(senderId) AS senderId,
+      message,
+      type,
+      BIN_TO_UUID(referenceId) AS referenceId,
+      isRead,
+      createdAt
+    FROM notification
+    WHERE userId = UUID_TO_BIN(?)
+    ORDER BY createdAt DESC
+  `;
+
+  const [rows] = await db.promise().query(sql, [userId]);
+  res.json(rows);
+});
+
 // =============================== Vào trang nhóm (render group.ejs) ===============================
 router.get("/:id", ensureAuth, async (req, res) => {
   try {
@@ -96,10 +446,12 @@ router.get("/:id", ensureAuth, async (req, res) => {
 
     // Thêm code chat
     // Kiểm tra xem nhóm đã có phòng chat chưa
-    const [chats] = await db.promise().query(
-      `SELECT BIN_TO_UUID(id) AS chatId FROM chat WHERE groupId = UUID_TO_BIN(?) LIMIT 1`,
-      [id]
-    );
+    const [chats] = await db
+      .promise()
+      .query(
+        `SELECT BIN_TO_UUID(id) AS chatId FROM chat WHERE groupId = UUID_TO_BIN(?) LIMIT 1`,
+        [id]
+      );
 
     let chatId;
     if (chats.length > 0) {
@@ -120,7 +472,6 @@ router.get("/:id", ensureAuth, async (req, res) => {
         [chatId, userId]
       );
     }
-
 
     res.render("group", { user, group, chatId });
   } catch (err) {
@@ -154,6 +505,32 @@ router.get("/:id/members", ensureAuth, async (req, res) => {
   }
 });
 
+// =============================== Lấy danh sách người phụ trách của task ===============================
+router.get("/:taskId/assignees", ensureAuth, async (req, res) => {
+  try {
+    const { taskId } = req.params;
+
+    const sql = `
+      SELECT 
+        BIN_TO_UUID(u.id) AS userId,
+        u.name,
+        u.avatarPath,
+        ta.status AS assigneeStatus
+      FROM task_assignee ta
+      JOIN user u ON ta.userId = u.id
+      WHERE ta.taskId = UUID_TO_BIN(?)
+    `;
+
+    const [rows] = await db.promise().query(sql, [taskId]);
+    res.json(rows);
+  } catch (err) {
+    console.error("GET /groups/:taskId/assignees error:", err);
+    res.status(500).json({ error: "Lỗi khi tải người phụ trách." });
+  }
+});
+
+//
+
 // ========================== XÓA NHÓM ==========================
 router.delete("/:id/delete", ensureAuth, async (req, res) => {
   try {
@@ -161,18 +538,26 @@ router.delete("/:id/delete", ensureAuth, async (req, res) => {
     const userId = req.session.user.id;
 
     // Kiểm tra người dùng có phải leader của nhóm không
-    const [checkLeader] = await db.promise().query(
-      `SELECT 1 FROM \`group\` WHERE id = UUID_TO_BIN(?) AND leaderId = UUID_TO_BIN(?)`,
-      [id, userId]
-    );
+    const [checkLeader] = await db
+      .promise()
+      .query(
+        `SELECT 1 FROM \`group\` WHERE id = UUID_TO_BIN(?) AND leaderId = UUID_TO_BIN(?)`,
+        [id, userId]
+      );
 
     if (checkLeader.length === 0) {
-      return res.status(403).json({ error: "Bạn không có quyền xóa nhóm này." });
+      return res
+        .status(403)
+        .json({ error: "Bạn không có quyền xóa nhóm này." });
     }
 
     // Xóa nhóm + liên kết thành viên + chat
-    await db.promise().query(`DELETE FROM group_user WHERE groupId = UUID_TO_BIN(?)`, [id]);
-    await db.promise().query(`DELETE FROM \`group\` WHERE id = UUID_TO_BIN(?)`, [id]);
+    await db
+      .promise()
+      .query(`DELETE FROM group_user WHERE groupId = UUID_TO_BIN(?)`, [id]);
+    await db
+      .promise()
+      .query(`DELETE FROM \`group\` WHERE id = UUID_TO_BIN(?)`, [id]);
     // await db.promise().query(`DELETE FROM chat WHERE groupId = UUID_TO_BIN(?)`, [id]);
 
     res.json({ success: true, message: "Đã xóa nhóm thành công." });
@@ -190,39 +575,53 @@ router.post("/:id/add-member", ensureAuth, async (req, res) => {
     const userId = req.session.user.id;
 
     if (!memberName || memberName.trim() === "") {
-      return res.status(400).json({ error: "Vui lòng nhập tên tài khoản hoặc email." });
+      return res
+        .status(400)
+        .json({ error: "Vui lòng nhập tên tài khoản hoặc email." });
     }
 
     // Kiểm tra quyền leader
-    const [checkLeader] = await db.promise().query(
-      `SELECT 1 FROM \`group\` WHERE id = UUID_TO_BIN(?) AND leaderId = UUID_TO_BIN(?)`,
-      [id, userId]
-    );
+    const [checkLeader] = await db
+      .promise()
+      .query(
+        `SELECT 1 FROM \`group\` WHERE id = UUID_TO_BIN(?) AND leaderId = UUID_TO_BIN(?)`,
+        [id, userId]
+      );
     if (checkLeader.length === 0) {
-      return res.status(403).json({ error: "Chỉ trưởng nhóm mới có quyền thêm thành viên." });
+      return res
+        .status(403)
+        .json({ error: "Chỉ trưởng nhóm mới có quyền thêm thành viên." });
     }
 
     // Tìm người dùng theo username hoặc email
-    const [userRows] = await db.promise().query(
-      `SELECT id FROM user WHERE username = ? OR email = ?`,
-      [memberName, memberName]
-    );
+    const [userRows] = await db
+      .promise()
+      .query(`SELECT id FROM user WHERE username = ? OR email = ?`, [
+        memberName,
+        memberName,
+      ]);
     if (userRows.length === 0) {
-      return res.status(404).json({ error: "Không tìm thấy tài khoản hoặc email này." });
+      return res
+        .status(404)
+        .json({ error: "Không tìm thấy tài khoản hoặc email này." });
     }
     const newUserId = userRows[0].id;
 
     // Kiểm tra đã là thành viên chưa
-    const [exists] = await db.promise().query(
-      `SELECT 1 FROM group_user WHERE groupId = UUID_TO_BIN(?) AND userId = ?`,
-      [id, newUserId]
-    );
+    const [exists] = await db
+      .promise()
+      .query(
+        `SELECT 1 FROM group_user WHERE groupId = UUID_TO_BIN(?) AND userId = ?`,
+        [id, newUserId]
+      );
     if (exists.length > 0) {
-      return res.status(409).json({ error: "Người này đã là thành viên của nhóm." });
+      return res
+        .status(409)
+        .json({ error: "Người này đã là thành viên của nhóm." });
     }
 
     // Thêm thành viên
-    const newGroupUserId = randomUUID({ version: 'v7' });// cách này ổn hơn với id = uuidv7()
+    const newGroupUserId = randomUUID({ version: "v7" }); // cách này ổn hơn với id = uuidv7()
 
     await db.promise().query(
       `INSERT INTO group_user (id, groupId, userId, roleInGroup, joinAt)
@@ -249,32 +648,44 @@ router.delete("/:id/remove-member", ensureAuth, async (req, res) => {
     }
 
     // Kiểm tra quyền leader
-    const [leaderCheck] = await db.promise().query(
-      `SELECT 1 FROM \`group\` WHERE id = UUID_TO_BIN(?) AND leaderId = UUID_TO_BIN(?)`,
-      [id, currentUserId]
-    );
+    const [leaderCheck] = await db
+      .promise()
+      .query(
+        `SELECT 1 FROM \`group\` WHERE id = UUID_TO_BIN(?) AND leaderId = UUID_TO_BIN(?)`,
+        [id, currentUserId]
+      );
     if (leaderCheck.length === 0) {
-      return res.status(403).json({ error: "Chỉ trưởng nhóm mới có quyền xoá thành viên." });
+      return res
+        .status(403)
+        .json({ error: "Chỉ trưởng nhóm mới có quyền xoá thành viên." });
     }
 
     // Kiểm tra người cần xoá có trong nhóm không
-    const [memberCheck] = await db.promise().query(
-      `SELECT 1 FROM group_user WHERE groupId = UUID_TO_BIN(?) AND userId = UUID_TO_BIN(?)`,
-      [id, removeUserId]
-    );
+    const [memberCheck] = await db
+      .promise()
+      .query(
+        `SELECT 1 FROM group_user WHERE groupId = UUID_TO_BIN(?) AND userId = UUID_TO_BIN(?)`,
+        [id, removeUserId]
+      );
     if (memberCheck.length === 0) {
-      return res.status(404).json({ error: "Không tìm thấy thành viên trong nhóm." });
+      return res
+        .status(404)
+        .json({ error: "Không tìm thấy thành viên trong nhóm." });
     }
 
     if (removeUserId === currentUserId) {
-      return res.status(400).json({ error: "Trưởng nhóm không thể tự xoá chính mình." });
+      return res
+        .status(400)
+        .json({ error: "Trưởng nhóm không thể tự xoá chính mình." });
     }
 
     // Xoá thành viên
-    await db.promise().query(
-      `DELETE FROM group_user WHERE groupId = UUID_TO_BIN(?) AND userId = UUID_TO_BIN(?)`,
-      [id, removeUserId]
-    );
+    await db
+      .promise()
+      .query(
+        `DELETE FROM group_user WHERE groupId = UUID_TO_BIN(?) AND userId = UUID_TO_BIN(?)`,
+        [id, removeUserId]
+      );
 
     // Cập nhật lại memberCount
     await db.promise().query(
@@ -320,7 +731,9 @@ router.post("/:id/leave", ensureAuth, async (req, res) => {
     const sessionUser = req.session.user;
 
     if (!sessionUser || !sessionUser.id) {
-      return res.status(401).json({ success: false, error: "Người dùng chưa đăng nhập." });
+      return res
+        .status(401)
+        .json({ success: false, error: "Người dùng chưa đăng nhập." });
     }
 
     const userId = sessionUser.id;
@@ -328,13 +741,17 @@ router.post("/:id/leave", ensureAuth, async (req, res) => {
     console.log("🧩 RỜI NHÓM:", { groupId: id, userId });
 
     // 1️⃣ Kiểm tra nhóm có tồn tại không
-    const [groups] = await db.promise().query(
-      `SELECT BIN_TO_UUID(leaderId) AS leaderId FROM \`group\` WHERE id = UUID_TO_BIN(?)`,
-      [id]
-    );
+    const [groups] = await db
+      .promise()
+      .query(
+        `SELECT BIN_TO_UUID(leaderId) AS leaderId FROM \`group\` WHERE id = UUID_TO_BIN(?)`,
+        [id]
+      );
 
     if (groups.length === 0) {
-      return res.status(404).json({ success: false, error: "Nhóm không tồn tại." });
+      return res
+        .status(404)
+        .json({ success: false, error: "Nhóm không tồn tại." });
     }
 
     const leaderId = groups[0].leaderId;
@@ -343,25 +760,33 @@ router.post("/:id/leave", ensureAuth, async (req, res) => {
     if (leaderId && leaderId.toLowerCase() === userId.toLowerCase()) {
       return res.status(400).json({
         success: false,
-        error: "Trưởng nhóm không thể rời nhóm. Hãy chuyển quyền hoặc xóa nhóm."
+        error:
+          "Trưởng nhóm không thể rời nhóm. Hãy chuyển quyền hoặc xóa nhóm.",
       });
     }
 
     // 3️⃣ Kiểm tra xem người dùng có trong nhóm không
-    const [check] = await db.promise().query(
-      `SELECT 1 FROM group_user WHERE groupId = UUID_TO_BIN(?) AND userId = UUID_TO_BIN(?)`,
-      [id, userId]
-    );
+    const [check] = await db
+      .promise()
+      .query(
+        `SELECT 1 FROM group_user WHERE groupId = UUID_TO_BIN(?) AND userId = UUID_TO_BIN(?)`,
+        [id, userId]
+      );
 
     if (check.length === 0) {
-      return res.status(404).json({ success: false, error: "Bạn không phải là thành viên của nhóm này." });
+      return res.status(404).json({
+        success: false,
+        error: "Bạn không phải là thành viên của nhóm này.",
+      });
     }
 
     // 4️⃣ Xóa khỏi group_user
-    await db.promise().query(
-      `DELETE FROM group_user WHERE groupId = UUID_TO_BIN(?) AND userId = UUID_TO_BIN(?)`,
-      [id, userId]
-    );
+    await db
+      .promise()
+      .query(
+        `DELETE FROM group_user WHERE groupId = UUID_TO_BIN(?) AND userId = UUID_TO_BIN(?)`,
+        [id, userId]
+      );
 
     // 5️⃣ Cập nhật lại memberCount
     await db.promise().query(
@@ -379,5 +804,46 @@ router.post("/:id/leave", ensureAuth, async (req, res) => {
     res.status(500).json({ success: false, error: "Lỗi khi rời nhóm." });
   }
 });
+
+router.post("/notifications/:id/read", ensureAuth, async (req, res) => {
+  const { id } = req.params;
+
+  await db.promise().query(
+    `
+    UPDATE notification
+    SET isRead = TRUE
+    WHERE id = UUID_TO_BIN(?)
+  `,
+    [id]
+  );
+
+  res.json({ success: true });
+});
+
+// API lấy thông báo cho user hiện tại
+router.get("/notifications", ensureAuth, async (req, res) => {
+  const userId = req.session.user.id;
+
+  const sql = `
+    SELECT 
+      BIN_TO_UUID(id) AS id,
+      message,
+      type,
+      isRead,
+      createdAt
+    FROM notification
+    WHERE userId = UUID_TO_BIN(?)
+    ORDER BY createdAt DESC
+  `;
+
+  try {
+    const [rows] = await db.promise().query(sql, [userId]);
+    res.json(rows);
+  } catch (err) {
+    console.error("GET /groups/notifications error:", err);
+    res.status(500).json({ error: "Lỗi khi tải thông báo." });
+  }
+});
+
 
 export default router;

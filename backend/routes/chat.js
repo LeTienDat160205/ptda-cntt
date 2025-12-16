@@ -9,7 +9,7 @@ const router = express.Router();
 router.get("/:chatId/messages", ensureAuth, async (req, res) => {
   try {
     const { chatId } = req.params;
-    console.log("GET messages for:", chatId);
+    console.log("📥 GET messages for:", chatId);
 
     const [messages] = await db.promise().query(
       `SELECT 

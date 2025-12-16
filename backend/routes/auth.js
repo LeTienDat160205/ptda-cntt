@@ -223,7 +223,7 @@ router.post("/forgot", async (req, res) => {
           text: `Xin chào,\n\nMật khẩu mới của bạn là: ${newPassword}\n\nVui lòng đăng nhập và đổi lại mật khẩu sau khi đăng nhập.\n\nTrân trọng,\nĐội ngũ WorkHub.`,
         });
 
-        console.log(`Đã gửi mật khẩu mới tới ${email}`);
+        console.log(`📩 Đã gửi mật khẩu mới tới ${email}`);
         return res.render("forgot", { error: null, success: "Mật khẩu mới đã được gửi tới email của bạn!" });
       } catch (mailErr) {
         console.error("Lỗi gửi email:", mailErr);

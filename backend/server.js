@@ -8,17 +8,22 @@ import { v7 as uuidv7 } from "uuid";
 import path from "path";
 import { fileURLToPath } from "url";
 import http from "http";
-import { createSocket } from "./config/socket.js";
 
 // Import các routes
 import authRoutes from "./routes/auth.js";
 import infoRoutes from "./routes/info.js";
 import groupRoutes from "./routes/group.js";
 import chatRoutes from "./routes/chat.js";
+import taskRoutes from "./routes/task.js";
+import chatUploadRoutes from "./routes/chatUpload.js";
+// routes thong bao
+import notificationRoutes from "./routes/notification.js";
 
 // chat real time
 import { initChatSocket } from "./chatLogic/chatLogic.js";
+import { createSocket } from "./config/socket.js";
 
+import chatbotRoutes  from "./routes/chatbot.js";
 
 // Setup
 const app = express();
@@ -50,12 +55,23 @@ app.use("/auth", authRoutes);
 app.use("/info", infoRoutes);
 app.use("/groups", groupRoutes);
 app.use("/chat", chatRoutes);
+app.use("/notification", notificationRoutes);
+
+// app.use("/tasks", taskRoutes);
+app.use(chatUploadRoutes);
+app.use("/uploads", express.static("uploads"));
+app.use("/tasks", taskRoutes);
+
+app.use("/api", chatbotRoutes );
 
 // Khởi tạo socket.io
 import { createServer } from "http";
 import { Server } from "socket.io";
 const server = createServer(app);
 const io = new Server(server, { cors: { origin: "*", methods: ["GET", "POST"] } });
+// CHO PHÉP ROUTER LẤY socket.io
+app.set("io", io);
+
 // Tạo logic chat real time
 initChatSocket(io);
 
@@ -73,4 +89,4 @@ app.get('/', (req, res) => {
 
 // app.listen(3000, () => console.log('Server running at http://localhost:3000'));
 const PORT = 3000;
-server.listen(PORT, () => console.log(`Server running at http://localhost:${PORT}`));
+server.listen(PORT, () => console.log(`🚀 Server running at http://localhost:${PORT}`));
